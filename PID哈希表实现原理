@@ -1,0 +1,190 @@
+ 在内核中，查找是必不可少的，比如说内核管理这么多用户进程，现在要快速定位
+ 某一个进程，这儿需要查找，还有，一个进程的地址空间中有多个虚存区，内核要快速
+ 定位进程地址空间的某个虚存区，这儿也需要查找，等等。其中用的最多就是基于树的
+ 查找-------->红黑树。和基于计算的查找------->哈希查找。两者的查找的效率高，而且
+ 适应内核的情况，而基于线性表的查找-------->二分查找，尽管效率高但不能适应内核
+ 里面的情况，现在版本的内核几乎不可能使用数组管理一些数据，这太原始了。而二分
+ 查找必须使用数组，所以内核中不用二分查找。
+--------------------------------------------------------------------------------
+1，内核哈希查找的初始化。（用于进程的快速查找）
+
+1. /*
+ 
+2.  * The pid hash table is scaled according to the amount of memory in the
+
+3.  * machine. From a minimum of 16 slots up to 4096 slots at one gigabyte or
+
+4.  * more.
+
+5.  */
+
+6. void __init pidhash_init(void)
+
+7. {
+
+8.         int i, pidhash_size;
+        //为数组开辟空间
+
+9.         pid_hash = alloc_large_system_hash("PID", sizeof(*pid_hash), 0, 18,
+
+10.                                            HASH_EARLY | HASH_SMALL,
+
+11.                                            &pidhash_shift, NULL, 4096); 
+12.         pidhash_size = 1 << pidhash_shift;//数组的长度
+
+13. 
+
+14.         for (i = 0; i < pidhash_size; i  )
+
+15.                 INIT_HLIST_HEAD(&pid_hash[i]);//将数组中的指针都初始化为NULL
+
+16. } 
+初始化思想很简单，就是建立一个哈希数组（自己定义的一个概念，哈希表中的那个数组），
+ 并将该数组进行初始化，该函数在start_kernel中被调用，至于数组的长度，可以写个小的
+ 内核模块很简单就可以把它的大小读出来。pidhash_shift是个全局的变量，没有导出，可以
+ 在内核符号表中找到其地址，cat /proc/kallsyms | grep pidhash_shift 把该值打印出来就
+ 知道数组的大小了。从上面的代码可以看出，这个数组的长度还依赖于机器内存的大小，一般
+ 内存环境该数组的长度都为4096.下面有个小模块可以读出pidhash_shift的值。
+--------------------------------------------------------------------------------------------
+
+1.   1 #include <linux/module.h>
+ 
+2.   2 #include <linux/kernel.h>
+
+3.   3 #include <linux/init.h>
+
+4.   4 #include <linux/moduleparam.h>
+
+5.   5 #include <linux/list.h>
+
+6.   6 #include <linux/hash.h>
+
+7.   7 
+
+8.     //cat /proc/kallsyms | grep pidhash_shift 
+9.   8 unsigned int *p_shift = (unsigned int *)0xc176ab0c; 
+10.   9 
+
+11.  10 static int __init hash_size_init(void)
+
+12.  11 {
+
+13.  12 ---printk("pidhash_shift----------------->%u\n",*p_shift);
+
+14.  13 ---return 0;
+
+15.  14 }
+
+16.  15 
+
+17.  16 static void __exit hash_size_exit(void)
+
+18.  17 {
+
+19.  18 printk("<1>exit ---------------------!\n");
+
+20.  19 }
+
+21.  20 
+
+22.  21 module_init(hash_size_init);
+
+23.  22 module_exit(hash_size_exit);
+
+24.  23 MODULE_LICENSE("GPL"); 
+--------------------------------------------------------------------------------------------
+ 2，哈希函数的建立。
+     哈希查找肯定离不开哈希函数，其实哈希函数就是一个数学函数，用来将实体分布在
+ 哈希表中，前少冲突的发生。
+
+1.  40 #define pid_hashfn(nr, ns) -\
+ 
+2.  41 ---hash_long((unsigned long)nr  (unsigned long)ns, pidhash_shift) 
+
+1. 26 #define hash_long(val, bits) hash_32(val, bits) 
+
+1.  19 /* 2^31 2^29 - 2^25 2^22 - 2^19 - 2^16 1 */
+  20 #define GOLDEN_RATIO_PRIME_32 0x9e370001UL 
+2.  
+ 
+3.  57 static inline u32 hash_32(u32 val, unsigned int bits)
+ 
+4.  58 {
+
+5.  59 ---/* On some cpus multiply is faster, on others gcc will do shifts */
+
+6.  60 ---u32 hash = val * GOLDEN_RATIO_PRIME_32;
+
+7.  61 
+
+8.  62 ---/* High bits are more random, so use them. */
+
+9.  63 ---return hash >> (32 - bits);
+
+10.  64 } 
+由此看出，内核将进程分布到哈希表的索引是由进程号和命名空间两个决定的，使用的
+ 数学函数也比较复杂。我想这也是为了减少冲突的发生。
+--------------------------------------------------------------------------------------------
+3，如何避免哈希冲突。
+     内核里面的哈希一般都是使用连地址法解决冲突，这种方式在应用上很可行，使用
+ 双向链表把冲突的节点都链接起来。 
+
+
+
+
+
+-----------------------------------------------------------------------------------------
+4,在创建进程的过程中往哈希表中插入进程的“索引”。
+ 进程在alloc_pid函数中将struct  pid插入到哈希表中。
+ 调用过程见下图：
+
+----------------------------------------------------------------------------------------------
+alloc_pid中的代码：
+
+
+1. spin_lock_irq(&pidmap_lock);
+ 
+2.         for ( ; upid >= pid->numbers; --upid)
+
+3.                 hlist_add_head_rcu(&upid->pid_chain,
+
+4.                                 &pid_hash[pid_hashfn(upid->nr, upid->ns)]);
+
+5. spin_unlock_irq(&pidmap_lock); 
+进程将创建好的struct pid中的nr和ns作为哈希函数的输入，从而计算出哈希数组的下标，
+ 然后使用头插法，将struct hlist_node *pid_chain节点插入到链表中。
+----------------------------------------------------------------------------------------------
+5，使用哈希查找快速定位struct pid
+在内核函数中，有个find_vpid函数，可以通过进程的pid快速找到进程的struct pid。
+ 其中就是在建立好的哈希表中进行查找。
+
+
+1. struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
+ 
+2. {
+
+3.         struct hlist_node *elem;
+
+4.         struct upid *pnr;
+
+5. 
+
+6.         hlist_for_each_entry_rcu(pnr, elem,
+
+7.                         &pid_hash[pid_hashfn(nr, ns)], pid_chain)
+
+8.                 if (pnr->nr == nr && pnr->ns == ns)
+
+9.                         return container_of(pnr, struct pid,
+
+10.                                         numbers[ns->level]);
+
+11. 
+
+12.         return NULL;
+
+13. } 
+find_vpid就是直接调用find_pid_ns，该函数的两个参数，一个是进程pid，一个是命名空间ns
+通过这两个就可以使用哈希函数定位到哈希数组的下标索引，然后遍历该数组单元的链表即可找到
+ 进程的struct pid
+ 
